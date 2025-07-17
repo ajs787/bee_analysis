@@ -1,21 +1,91 @@
-#!/common/home/rmartin/bin/python3
-# This code writes scripts to do both (1) data preparation and (2) training/evaluation on video
-# files for the ML behavior disriminator videos on the Rutgers CS computing infrastructure.
-# (c) 2023 R. P. Martin. This code is licensed under the GNU General Public License (GPL), version 3
-# This program takes the video list in a main data csv file and breaks it up into training and testing data sets to run k-fold validation.
-# The main dataset.csv file is created by the command 'make_train_csv.py' script and is used as input to this script.
-# After taking the input csv list, this script creates 4 additional kinds of files as output. What is produced is:
-# 1. A set of N smaller dataset.csv files, used for cross-fold validation, broken up from the main dataset.csv file
-# 2. N batch.sh shell scripts to to call the VidActRecDataprep.py script on the above data set files to perform the data preparation.
-# 3. A global shell file (sbatch) to run the slurm sbatch command on the above batch files.
-# 4. N training.sh shell scripts to to call the VidActRecTrain.py script on the above data tar files to perform training and evaluation.
-# 5. A batch script that runs the training scripts using the slurm sbatch command and srun commands (to get GPUs)
-# This script breaks up the large dataset file into multiple smaller randomized sets of 1/N size each
-# The number of sets is controlled with the --k parameter below
-# This script then creates these N dataset_XX.csv files from the main dataset file, as well
-# as N shell file that calls the VidActRecDataprep.py script that creates the tar file for the training and testing script.
-# The k-fold validation approach is described here:
-# See: https://towardsdatascience.com/k-fold-cross-validation-explained-in-plain-english-659e33c0bc0
+"""
+Module Name: make_validation_training.py
+
+Description:
+    Sets up k-fold cross‑validation for video behavior discriminator pipelines on Rutgers CS infrastructure.
+    - Splits a master dataset CSV into k balanced folds.
+    - Generates per‑fold CSVs (dataset_0.csv … dataset_{k-1}.csv).
+    - Creates N data preparation batch scripts (VidActRecDataprep.py) for each fold.
+    - Builds a global sbatch script to submit all data prep jobs.
+    - Generates N training scripts (VidActRecTrain.py) for each fold.
+    - Builds a training sbatch submission script using srun for GPU jobs.
+
+Usage:
+    python make_validation_training.py \
+        --in-path <input_dir> \
+        --out-path <output_dir> \
+        --datacsv <dataset.csv> \
+        --k <num_folds> \
+        [--batchdir <batch_dir>] \
+        [--seed <seed>] \
+        [--training <training_base>] \
+        [--model <model_name>] \
+        [--only_split] \
+        [--width <px>] [--height <px>] \
+        [--crop_x_offset <px>] [--crop_y_offset <px>] \
+        [--label_offset <offset>] \
+        [--training_only] \
+        [--frames_per_sample <n>] \
+        [--epochs <n>] \
+        [--gpus <n>] \
+        [--remove-dataset-sub] \
+        [--gradcam_cnn_model_layer <layers>...] \
+        [--time-to-run-training <seconds>] \
+        [--num-outputs <n>] \
+        [--path_to_file <bee_analysis_dir>] \
+        [--binary-training-optimization] \
+        [--use-dataloader-workers] \
+        [--max-dataloader-workers <n>] \
+        [--loss-fn <loss_function>]
+
+Arguments:
+    --in-path                   Input directory for the master CSV. (default: “.”)
+    --out-path                  Output directory for generated CSVs and scripts. (default: “.”)
+    --datacsv                   Name of the master dataset CSV. (default: “dataset.csv”)
+    --k                         Number of folds to create. (default: 3)
+    --batchdir                  Working directory for sbatch jobs. (default: “.”)
+    --seed                      Random seed for fold shuffling. (default: 01011970)
+    --training                  Base name for the main training batch script. (default: “training-run”)
+    --model                     Model name for training scripts. (default: “alexnet”)
+    --only_split                Only perform CSV splitting; skip script generation.
+    --width, --height           Output crop dimensions in pixels. (default: 400×400)
+    --crop_x_offset, --crop_y_offset  
+                                Crop offsets in pixels. (default: 0,0)
+    --label_offset              Class label offset for training. (default: 0)
+    --training_only             Generate only training set files. (default: False)
+    --frames_per_sample         Frames per sample in training. (default: 1)
+    --epochs                    Number of training epochs. (default: 10)
+    --gpus                      GPUs per SLURM job. (default: 1)
+    --remove-dataset-sub        Skip creating per‑fold dataset CSV files.
+    --gradcam_cnn_model_layer   Layers for GradCAM plots. (default: model_a.4.0 model_b.4.0)
+    --time-to-run-training      SLURM time limit per job in seconds. (default: 28800)
+    --num-outputs               Number of output classes. (default: 3)
+    --path_to_file              Directory of VidActRecDataprep.py and VidActRecTrain.py (default: bee_analysis)
+    --binary-training-optimization
+                                Enable binary training optimization. (default: False)
+    --use-dataloader-workers    Use DataLoader workers in training script. (default: False)
+    --max-dataloader-workers    Number of DataLoader workers. (default: 3)
+    --loss-fn                   Loss function for training. (choices: CrossEntropyLoss, NLLLoss, etc.; default: CrossEntropyLoss)
+
+Workflow:
+    1. Read and parse the master dataset CSV; group entries by class.
+    2. Shuffle each class’s rows using the provided seed.
+    3. Evenly distribute rows into k folds.
+    4. Write per‑fold CSV files (`dataset_0.csv` … `dataset_{k-1}.csv`).
+       If `--only_split` is set, exit here.
+    5. Generate:
+         - `training-run.sh`: sets up virtualenv and installs requirements.
+         - `train_{i}.sh`: runs VidActRecTrain.py on fold i’s tar/bin files.
+         - A master sbatch submission script invoking all training jobs with SLURM directives.
+    6. Make all `.sh` and `.log` files executable.
+
+Dependencies:
+    - Python 3.x
+    - pandas
+    - OpenCV (for preprocessing/training scripts)
+    - SLURM environment (`sbatch`, `srun`)
+"""
+
 import argparse
 import csv
 import logging
@@ -31,23 +101,44 @@ logging.basicConfig(
 parser = argparse.ArgumentParser(description="Create k-fold validation sets.")
 
 parser.add_argument(
+    "--in-path",
+    type=str,
+    required=False, 
+    default=".",
+    help="the input path"
+)
+
+parser.add_argument(
+    "--out-path",
+    type=str,
+    required=False,
+    default=".",
+    help="output file path"
+)
+
+
+parser.add_argument(
     "--datacsv",
     type=str,
     required=False,
     default="dataset.csv",
     help="name of the dataset, default dataset.csv",
 )
-parser.add_argument("--k",
-                    type=int,
-                    required=False,
-                    default=3,
-                    help="number of sets, default 3")
+parser.add_argument(
+    "--k", type=int, required=False, default=3, help="number of sets, default 3"
+)
 parser.add_argument(
     "--batchdir",
     type=str,
     required=False,
     default=".",
     help="working directory for the sbatch run jobs, default: .",
+)
+parser.add_argument(
+    "--venv-path",
+    type=str,
+    default=".",
+    help="the path to the virtual environment that you want to use (absolute probably); default: '.'"
 )
 parser.add_argument(
     "--seed",
@@ -82,40 +173,35 @@ parser.add_argument(
     type=int,
     required=False,
     default=400,
-    help=
-    "Width of output images (obtained via cropping, after applying scale), default 400",
+    help="Width of output images (obtained via cropping, after applying scale), default 400",
 )
 parser.add_argument(
     "--height",
     type=int,
     required=False,
     default=400,
-    help=
-    "Height of output images (obtained via cropping, after applying scale), default 400",
+    help="Height of output images (obtained via cropping, after applying scale), default 400",
 )
 parser.add_argument(
     "--crop_x_offset",
     type=int,
     required=False,
     default=0,
-    help=
-    "The offset (in pixels) of the crop location on the original image in the x dimension, default 0",
+    help="The offset (in pixels) of the crop location on the original image in the x dimension, default 0",
 )
 parser.add_argument(
     "--crop_y_offset",
     type=int,
     required=False,
     default=0,
-    help=
-    "The offset (in pixels) of the crop location on the original image in the y dimension, default 0",
+    help="The offset (in pixels) of the crop location on the original image in the y dimension, default 0",
 )
 parser.add_argument(
     "--label_offset",
     required=False,
     default=0,
     type=int,
-    help=
-    'The starting value of classes when training with cls labels (the labels value is "cls"), default: 0',
+    help='The starting value of classes when training with cls labels (the labels value is "cls"), default: 0',
 )
 parser.add_argument(
     "--training_only",
@@ -123,13 +209,6 @@ parser.add_argument(
     required=False,
     default=False,
     help="only generate the training set files, default: False",
-)
-parser.add_argument(
-    "--path_to_file",
-    type=str,
-    required=False,
-    default="bee_analysis",
-    help="path to bee analysis files, default: bee_analysis",
 )
 parser.add_argument(
     "--frames_per_sample",
@@ -188,12 +267,17 @@ parser.add_argument(
 parser.add_argument(
     "--num-outputs",
     required=False,
-    help=
-    "the number of outputs/classes that are required, used for the train command",
+    help="the number of outputs/classes that are required, used for the train command",
     default=3,
     type=int,
 )
-
+parser.add_argument(
+    "--path_to_file",
+    type=str,
+    required=False,
+    default="bee_analysis",
+    help="path to bee analysis files, default: bee_analysis",
+)
 # flatbin stuff
 parser.add_argument(
     "--binary-training-optimization",
@@ -216,8 +300,7 @@ parser.add_argument(
     type=int,
     default=3,
     required=False,
-    help=
-    "The number of dataloader workers, default=3. Only works when the `--use-dataloader-workers` flag is passed.",
+    help="The number of dataloader workers, default=3. Only works when the `--use-dataloader-workers` flag is passed.",
 )
 
 parser.add_argument(
@@ -246,7 +329,7 @@ trainProgram = os.path.join(program_dir, "VidActRecTrain.py")
 
 datacsvname = args.datacsv
 numOfSets = args.k
-batchdir = args.batchdir
+batchdir = os.path.join(args.out_path, args.batchdir)
 seed = args.seed
 training_filename = args.training + ".sh"
 model_name = args.model
@@ -266,7 +349,8 @@ trainCommand = (
     f" --not_deterministic --epochs {args.epochs}"
     f" --modeltype {model_name} "
     f" --label_offset {label_offset} "
-    f" --loss_fun {args.loss_fn} ")
+    f" --loss_fun {args.loss_fn} "
+)
 
 if args.binary_training_optimization:
     trainCommand += " --labels cls " " --convert_idx_to_classes 1 " " --skip_metadata "
@@ -275,7 +359,7 @@ if args.use_dataloader_workers:
     trainCommand += f" --num_workers {args.max_dataloader_workers} "
 
 # evaluation has to be last because it has to be placed adjacent to the tar files
-trainCommand+=  " --evaluate " 
+trainCommand += " --evaluate "
 
 logging.info(f"dataset is {datacsvname}")
 
@@ -283,7 +367,7 @@ logging.info(f"dataset is {datacsvname}")
 random.seed(seed)
 
 if not args.remove_dataset_sub:
-    with open(datacsvname) as datacsv:
+    with open(os.path.join(args.out_path, datacsvname)) as datacsv:
         conf_reader = csv.reader(datacsv)
         header = next(conf_reader)
         # Remove all spaces from the header strings
@@ -319,13 +403,12 @@ if not args.remove_dataset_sub:
 baseNameFile = datacsvname.split(".csv")
 baseName = baseNameFile[0]
 setNum = 0
-currentDir = os.getcwd()
 
 # Write out the split csv files.
 if not args.remove_dataset_sub:
     for dataset_num in range(numOfSets):
         dataset_filename = baseName + "_" + str(dataset_num) + ".csv"
-        with open(dataset_filename, "w") as dsetFile:
+        with open(os.path.join(args.out_path, dataset_filename), "w") as dsetFile:
             # write out the header row at the top of the set
             dsetFile.write("file, class, begin frame, end frame\n")
             # write out all the rows for this set from the corresponding fold
@@ -337,44 +420,46 @@ if not args.remove_dataset_sub:
 if args.only_split:
     sys.exit(0)
 
-if batchdir == ".":
-    batchdir = currentDir
 
-training_batch_file = open(training_filename, "w")
+training_batch_file = open(os.path.join(args.out_path, training_filename), "w")
 training_batch_file.write("#!/usr/bin/bash \n")
-training_batch_file.write("source venv/bin/activate \n")
+training_batch_file.write(f"source {os.path.join(args.venv_path, 'venv/bin/activate')} \n")
+
+training_batch_file.write(f"pip install --no-compile -r {os.path.join(program_dir, 'requirements.txt')}\n")
+training_batch_file.write("# batch file for getting the training results \n \n")
 training_batch_file.write(
-    "# batch file for getting the training results \n \n")
-training_batch_file.write("cd " + currentDir + " \n")
-training_batch_file.write(
-    "echo start-is: `date` \n \n")  # add start timestamp to training file
+    "echo start-is: `date` \n \n"
+)  # add start timestamp to training file
 
 for dataset_num in range(numOfSets):
     train_job_filename = "train" + "_" + str(dataset_num) + ".sh"
 
     # open the batch file that runs the testing and training commands
-    with open(train_job_filename, "w") as trainFile:
+    with open(os.path.join(args.out_path, train_job_filename), "w") as trainFile:
         trainFile.write("#!/usr/bin/bash \n")
-        trainFile.write("source venv/bin/activate \n")
+        
+        
+        trainFile.write(f"source {os.path.join(args.venv_path, 'venv/bin/activate')} \n")
         trainFile.write("# command to run \n \n")
         trainFile.write("export TRAINPROGRAM=" + trainProgram + "\n")
-        trainFile.write("cd " + currentDir + " \n")
         trainFile.write("echo start-is: `date` \n \n")  # add start timestamp
         traincommand_local = trainCommand
         traincommand_local = (
-            traincommand_local + " " +
-            f"{baseName}_{str(dataset_num)}.{'tar' if not args.binary_training_optimization else 'bin'}"
+            traincommand_local
+            + " "
+            + f"{baseName}_{str(dataset_num)}.{'tar' if not args.binary_training_optimization else 'bin'}"
         )
         for trainingSetNum in range(numOfSets):
             if int(trainingSetNum) != int(dataset_num):
                 traincommand_local = (
-                    traincommand_local + " " +
-                    f"{baseName}_{str(trainingSetNum)}.{'tar' if not args.binary_training_optimization else 'bin'}"
+                    traincommand_local
+                    + " "
+                    + f"{baseName}_{str(trainingSetNum)}.{'tar' if not args.binary_training_optimization else 'bin'}"
                 )
 
         trainFile.write(
-            traincommand_local +
-            "\n")  # write the training command to the training command
+            traincommand_local + "\n"
+        )  # write the training command to the training command
         trainFile.write(
             "chmod -R 777 gradcam_plots saliency_maps *.log >> /dev/null 2>&1 \n"
         )  # change the permissions of the shell scripts to be executable.
@@ -388,14 +473,16 @@ for dataset_num in range(numOfSets):
             f" --time={args.time_to_run_training} "
             f" -o {baseName}_trainlog_{str(dataset_num)}.log "
             f"{train_job_filename} "
-            "\n")  # add end timestamp to training file
+            "\n"
+        )  # add end timestamp to training file
 
     setNum = setNum + 1
 
 training_batch_file.write(
-    "echo end-is: `date` \n \n")  # add end timestamp to training file
+    "echo end-is: `date` \n \n"
+)  # add end timestamp to training file
 training_batch_file.close()
 
 logging.info("Done writing dataset and job files")
 # change the permissions of the shell scripts to be executable.
-os.system("chmod 777 *.log *.sh")
+os.system(f"chmod 777 {os.path.join(args.out_path, '*.log')} {os.path.join(args.out_path, '*.sh')}")
